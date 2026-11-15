@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>logstream: live log anomalies</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --text:#e6e6e6; --muted:#8b93a1; --sev:#e45756; --new:#f2a541; --spike:#4c9be8; --ok:#54a24b; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, Segoe UI, Roboto, sans-serif; background:var(--bg); color:var(--text); }
+  header { padding:16px 24px; display:flex; align-items:baseline; gap:16px; border-bottom:1px solid #222733; }
+  header h1 { font-size:18px; margin:0; }
+  header span { color:var(--muted); font-size:13px; }
+  main { padding:16px 24px; display:grid; gap:16px; grid-template-columns: repeat(4, 1fr); }
+  .card { background:var(--panel); border-radius:10px; padding:14px 16px; }
+  .kpi .v { font-size:28px; font-weight:600; margin-top:4px; }
+  .kpi .l { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.05em; }
+  .wide { grid-column: span 2; } .full { grid-column: span 4; }
+  canvas { width:100%; height:140px; }
+  table { width:100%; border-collapse:collapse; font-size:12.5px; }
+  td, th { padding:6px 8px; border-bottom:1px solid #222733; text-align:left; vertical-align:top; }
+  th { color:var(--muted); font-weight:500; }
+  .tag { font-size:11px; padding:2px 6px; border-radius:4px; font-weight:600; white-space:nowrap; }
+  .SEVERITY { background:rgba(228,87,86,.18); color:var(--sev); }
+  .NEW_TEMPLATE { background:rgba(242,165,65,.18); color:var(--new); }
+  .RATE_SPIKE { background:rgba(76,155,232,.18); color:var(--spike); }
+  code { font-family: ui-monospace, Consolas, monospace; font-size:12px; color:#cbd2dc; word-break:break-all; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--ok); margin-right:6px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr 1fr; } .wide, .full { grid-column: span 2; } }
+</style>
+</head>
+<body>
+<header><h1>logstream</h1><span><span class="dot" id="dot"></span><span id="status">connecting…</span></span></header>
+<main>
+  <div class="card kpi"><div class="l">lines processed</div><div class="v" id="lines">0</div></div>
+  <div class="card kpi"><div class="l">templates (Drain)</div><div class="v" id="templates">0</div></div>
+  <div class="card kpi"><div class="l">alerts</div><div class="v" id="alerts">0</div></div>
+  <div class="card kpi"><div class="l">lines / second</div><div class="v" id="rate">0</div></div>
+  <div class="card wide"><div class="l" style="color:var(--muted);font-size:12px">THROUGHPUT (last 2 min)</div><canvas id="spark" width="600" height="140"></canvas></div>
+  <div class="card wide"><div class="l" style="color:var(--muted);font-size:12px">ALERTS BY TYPE</div><canvas id="bars" width="600" height="140"></canvas></div>
+  <div class="card full"><table><thead><tr><th>type</th><th>time</th><th>template</th><th>detail</th></tr></thead><tbody id="alertRows"></tbody></table></div>
+  <div class="card full"><table><thead><tr><th>#</th><th>count</th><th>top templates</th></tr></thead><tbody id="tplRows"></tbody></table></div>
+</main>
+<script>
+const hist = []; let lastLines = null, lastT = null;
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fmt = n => n.toLocaleString('en-US');
+
+function spark(cv, data) {
+  const ctx = cv.getContext('2d'), w = cv.width, h = cv.height; ctx.clearRect(0,0,w,h);
+  if (data.length < 2) return; const max = Math.max(...data, 1);
+  ctx.strokeStyle = '#4c9be8'; ctx.lineWidth = 2; ctx.beginPath();
+  data.forEach((v,i) => { const x = i*(w/(data.length-1)), y = h-6-(v/max)*(h-16); i ? ctx.lineTo(x,y) : ctx.moveTo(x,y); });
+  ctx.stroke(); ctx.fillStyle = '#8b93a1'; ctx.font = '11px system-ui'; ctx.fillText('max ' + fmt(Math.round(max)) + ' /s', 4, 12);
+}
+function bars(cv, counts) {
+  const ctx = cv.getContext('2d'), w = cv.width, h = cv.height; ctx.clearRect(0,0,w,h);
+  const kinds = [['SEVERITY','#e45756'],['NEW_TEMPLATE','#f2a541'],['RATE_SPIKE','#4c9be8']];
+  const max = Math.max(1, ...kinds.map(k => counts[k[0]] || 0));
+  kinds.forEach(([k,c],i) => { const v = counts[k] || 0, y = 12 + i*42, bw = (w-190)*(v/max);
+    ctx.fillStyle = '#8b93a1'; ctx.font = '12px system-ui'; ctx.fillText(k, 0, y+18);
+    ctx.fillStyle = c; ctx.fillRect(120, y+4, Math.max(bw,2), 22);
+    ctx.fillStyle = '#e6e6e6'; ctx.fillText(fmt(v), 128+bw, y+20); });
+}
+async function tick() {
+  try {
+    const [s, a, t] = await Promise.all(['stats','alerts?limit=15','templates?top=8'].map(p => fetch(p).then(r => r.json())));
+    const now = performance.now() / 1000;
+    if (lastLines !== null) { hist.push(Math.max(0, (s.lines_seen - lastLines) / (now - lastT))); if (hist.length > 120) hist.shift(); }
+    lastLines = s.lines_seen; lastT = now;
+    document.getElementById('lines').textContent = fmt(s.lines_seen);
+    document.getElementById('templates').textContent = fmt(s.templates);
+    document.getElementById('alerts').textContent = fmt(Object.values(s.alerts_by_kind).reduce((x,y)=>x+y,0));
+    document.getElementById('rate').textContent = fmt(Math.round(hist.at(-1) || 0));
+    document.getElementById('status').textContent = s.warming_up ? 'warming up (learning normal templates)…' : 'live';
+    spark(document.getElementById('spark'), hist); bars(document.getElementById('bars'), s.alerts_by_kind);
+    document.getElementById('alertRows').innerHTML = a.map(x =>
+      `<tr><td><span class="tag ${x.kind}">${x.kind}</span></td><td>${new Date(x.time*1000).toISOString().slice(0,19).replace('T',' ')}</td><td><code>${esc(x.template)}</code></td><td>${esc(x.detail)}</td></tr>`).join('');
+    document.getElementById('tplRows').innerHTML = t.map((x,i) =>
+      `<tr><td>${i+1}</td><td>${fmt(x.count)}</td><td><code>${esc(x.template)}</code></td></tr>`).join('');
+  } catch (e) { document.getElementById('status').textContent = 'disconnected'; }
+}
+setInterval(tick, 1000); tick();
+</script>
+</body>
+</html>
