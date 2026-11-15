@@ -8,15 +8,23 @@ Three alert types, chosen from what worked in log-anomaly-bench (offline study o
                 (count > mean + k*std of its previous minutes, with an absolute floor)
 
 Time is passed in explicitly so the detector is deterministic and testable.
+
+State (learned templates, per-template rate statistics, counters, recent alerts) can be saved to
+and restored from a JSON file, so a restart does not reset what the detector has learned.
 """
+import json
+import os
 import re
 from collections import Counter, deque
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 
+import jsonpickle
 from drain3 import TemplateMiner
 from drain3.masking import MaskingInstruction
 from drain3.template_miner_config import TemplateMinerConfig
 
+STATE_VERSION = 1
 LEVEL_RE = re.compile(r"\b(FATAL|CRITICAL|FAILURE|SEVERE|ERROR|WARNING|WARN|INFO|DEBUG)\b")
 SEVERE = {"FATAL", "CRITICAL", "FAILURE"}
 
@@ -144,3 +152,53 @@ class StreamDetector:
                 "levels": dict(self.level_counts),
                 "alerts_by_kind": dict(self.alert_totals),
                 "warming_up": self.lines_seen <= self.warmup_lines}
+
+    # ------------------------------------------------------------------ persistence
+    def to_state(self) -> dict:
+        """Everything learned so far, as JSON-serialisable data.
+
+        Not saved on purpose: the per-minute dedup sets (they only matter within the current minute).
+        """
+        return {
+            "version": STATE_VERSION,
+            "lines_seen": self.lines_seen,
+            "level_counts": dict(self.level_counts),
+            "template_counts": {str(k): v for k, v in self.template_counts.items()},
+            "alert_totals": dict(self.alert_totals),
+            "alerts": [a.to_dict() for a in self.alerts],
+            "rate_stats": {str(k): asdict(s) for k, s in self._stats.items()},
+            # same encoding Drain3 uses for its own snapshots
+            "drain": jsonpickle.dumps(self.miner.drain, keys=True),
+        }
+
+    def restore(self, state: dict) -> None:
+        if state.get("version") != STATE_VERSION:
+            raise ValueError(f"unsupported state version {state.get('version')!r}")
+        drain = jsonpickle.loads(state["drain"], keys=True)
+        self.miner.drain.id_to_cluster = {int(k): v for k, v in drain.id_to_cluster.items()}
+        self.miner.drain.clusters_counter = drain.clusters_counter
+        self.miner.drain.root_node = drain.root_node
+        self.lines_seen = state["lines_seen"]
+        self.level_counts = Counter(state["level_counts"])
+        self.template_counts = Counter({int(k): v for k, v in state["template_counts"].items()})
+        self.alert_totals = Counter(state["alert_totals"])
+        self.alerts = deque((Alert(**a) for a in state["alerts"][-self.max_alerts:]))
+        self._stats = {int(k): TemplateStats(**s) for k, s in state["rate_stats"].items()}
+
+    def save(self, path: str | Path) -> None:
+        """Atomic write: a crash mid-save never leaves a half-written state file."""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(self.to_state()), encoding="utf-8")
+        os.replace(tmp, path)
+
+    @classmethod
+    def load(cls, path: str | Path, **kwargs) -> "StreamDetector":
+        """Build a detector with the given settings and restore its learned state from `path`.
+
+        The file is decoded with jsonpickle, so only load state files this service wrote itself.
+        """
+        det = cls(**kwargs)
+        det.restore(json.loads(Path(path).read_text(encoding="utf-8")))
+        return det
