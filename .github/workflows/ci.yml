@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt -e .
+      - run: pytest -q
+
+  docker:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t logstream:ci .
+      - name: Smoke test
+        run: |
+          docker run -d -p 8000:8000 --name ls logstream:ci
+          for i in $(seq 1 20); do curl -sf localhost:8000/health && break; sleep 1; done
+          curl -sf -X POST localhost:8000/ingest -H 'Content-Type: application/json' \
+               -d '{"lines": ["KERNEL FATAL data TLB error interrupt"], "timestamp": 0}' | grep SEVERITY
+          docker rm -f ls
