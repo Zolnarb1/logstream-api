@@ -55,7 +55,10 @@ Configuration via environment variables:
 | `LOGSTREAM_SAVE_EVERY` | 30 | max seconds between automatic saves while ingesting |
 
 ## Persistence
-Without it, a restart forgets every learned template, so the first minutes after each deploy would fire a flood of false `NEW_TEMPLATE` alerts and rate statistics would start from zero.
+Without it, a restart forgets every learned template: message types the service already knew get reported as "new" again, and rate statistics start from zero.
+
+![Restart effect](docs/restart_effect.png)
+*`scripts/restart_effect.py`: 200k BGL lines, restart at the halfway point. The in-memory detector raises 80 `NEW_TEMPLATE` alerts on the second half; the restored one raises 40, only for templates it had never seen.*
 
 - **What is saved:** the Drain template tree, per-template rate statistics (Welford mean/variance), counters and recent alerts. The per-minute dedup sets are not saved, since they only matter within the current minute.
 - **When:** at startup the state is restored; while ingesting it is saved at most every `LOGSTREAM_SAVE_EVERY` seconds; on graceful shutdown (SIGTERM, `docker stop`) it is saved once more. `POST /snapshot` forces a save.
