@@ -26,8 +26,16 @@ jobs:
         run: docker build -t logstream:ci .
       - name: Smoke test
         run: |
-          docker run -d -p 8000:8000 --name ls logstream:ci
+          docker run -d -p 8000:8000 -v lsdata:/data --name ls logstream:ci
           for i in $(seq 1 20); do curl -sf localhost:8000/health && break; sleep 1; done
           curl -sf -X POST localhost:8000/ingest -H 'Content-Type: application/json' \
                -d '{"lines": ["KERNEL FATAL data TLB error interrupt"], "timestamp": 0}' | grep SEVERITY
-          docker rm -f ls
+      - name: Restart keeps state
+        run: |
+          docker stop ls && docker rm ls                 # graceful stop -> state saved on shutdown
+          docker run -d -p 8000:8000 -v lsdata:/data --name ls2 logstream:ci
+          for i in $(seq 1 20); do curl -sf localhost:8000/health && break; sleep 1; done
+          curl -sf localhost:8000/stats | tee stats.json
+          grep -q '"lines_seen":1' stats.json
+          grep -q '"restored_from_state":true' stats.json
+          docker rm -f ls2

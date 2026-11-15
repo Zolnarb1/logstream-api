@@ -21,6 +21,7 @@ Templates are mined online with [Drain3](https://github.com/logpai/Drain3). Numb
 | `GET` | `/alerts?limit=50&kind=SEVERITY` | recent alerts, newest first |
 | `GET` | `/templates?top=20` | most frequent templates |
 | `GET` | `/stats` | counters for the dashboard |
+| `POST` | `/snapshot` | save the detector state now (when persistence is on) |
 | `GET` | `/health` | liveness probe |
 | `GET` | `/` | live dashboard (vanilla JS, polls every second) |
 
@@ -40,11 +41,28 @@ uvicorn logstream.api:app --port 8000
 python scripts/replay.py --speed 10        # in a 2nd terminal: stream a real log in
                                            # then open http://localhost:8000
 
-# docker
+# docker (state kept in a named volume, survives restarts and upgrades)
 docker build -t logstream .
-docker run -p 8000:8000 logstream
+docker run -p 8000:8000 -v logstream-data:/data logstream
 ```
-Configuration via environment variables: `LOGSTREAM_WARMUP` (lines before new-template alerts start, default 500) and `LOGSTREAM_SPIKE_K` (σ multiplier, default 4).
+Configuration via environment variables:
+
+| Variable | Default | |
+|---|---|---|
+| `LOGSTREAM_WARMUP` | 500 | lines before new-template alerts start |
+| `LOGSTREAM_SPIKE_K` | 4 | σ multiplier for rate spikes |
+| `LOGSTREAM_STATE` | unset locally, `/data/state.json` in Docker | where to persist state; unset = in-memory only |
+| `LOGSTREAM_SAVE_EVERY` | 30 | max seconds between automatic saves while ingesting |
+
+## Persistence
+Without it, a restart forgets every learned template, so the first minutes after each deploy would fire a flood of false `NEW_TEMPLATE` alerts and rate statistics would start from zero.
+
+- **What is saved:** the Drain template tree, per-template rate statistics (Welford mean/variance), counters and recent alerts. The per-minute dedup sets are not saved, since they only matter within the current minute.
+- **When:** at startup the state is restored; while ingesting it is saved at most every `LOGSTREAM_SAVE_EVERY` seconds; on graceful shutdown (SIGTERM, `docker stop`) it is saved once more. `POST /snapshot` forces a save.
+- **Safety:** writes are atomic (temp file + rename), so a crash mid-save never leaves a half-written file. A corrupt state file is moved aside to `state.json.corrupt` and the service starts fresh instead of crash-looping.
+- **Cost, measured** (`scripts/bench_state.py`, 200k BGL lines, 90 templates): 154 KiB state file, 7 ms to save, 6 ms to restore, restored stats identical.
+- **Tested:** round-trip equality, no false `NEW_TEMPLATE` after restart, rate spikes still detected after restart, save on shutdown, corrupt-file handling. CI also restarts the real container on a volume and checks the state came back.
+- **Caveat:** the template tree is encoded with jsonpickle (Drain3's own snapshot format), which can instantiate Python objects, so only load state files this service wrote.
 
 ## Engineering notes
 - **Throughput:** the detector handles ~150k lines/s on one laptop thread (`scripts/bench.py`, 200k BGL lines, detection logic only, without HTTP).
@@ -52,12 +70,12 @@ Configuration via environment variables: `LOGSTREAM_WARMUP` (lines before new-te
 - **Thread safety:** Drain3 isn't thread-safe, so a lock wraps detector access in the API.
 - **Bounded memory:** the alert buffer is capped (500), as is the per-minute dedup set.
 - **Input validation:** Pydantic models reject malformed payloads with 422 and cap batch size (10,000 lines).
-- **Tests** (`tests/`): each alert type, warm-up, per-minute dedup, rate-spike dedup, endpoint filters, bad payloads.
-- **CI** (`.github/workflows/ci.yml`): runs the tests, builds the Docker image, starts it, and smoke-tests `/health` and `/ingest`.
+- **Tests** (`tests/`, 13): each alert type, warm-up, per-minute dedup, rate-spike dedup, endpoint filters, bad payloads, persistence.
+- **CI** (`.github/workflows/ci.yml`): runs the tests, builds the Docker image, starts it, smoke-tests `/health` and `/ingest`, then restarts the container on the same volume and checks the state was restored.
 - **Container:** non-root user, healthcheck, slim base image.
 
 ## Limitations / next steps
-- State is in memory: a restart forgets learned templates. Next step: persist Drain state (Drain3 supports Redis/file persistence).
+- ~~State is in memory: a restart forgets learned templates.~~ Done in v0.2 (see Persistence). A file per instance is fine for one node; several replicas would need shared storage such as Redis.
 - Single process: scaling out would need a message queue (e.g. Kafka) and per-source detectors.
 - No ground-truth evaluation in this repo. The offline evaluation lives in log-anomaly-bench.
 
